@@ -17,3 +17,5 @@ Para que a automação funcione em novos projetos, garanta que a seguintes vari�
 Para que o projeto rode isolado e seguro no servidor, a sua Stack no **Portainer** deve apontar para a rede modular `dev-network`. 
 
 Use o modelo em `docker-compose.template.yml`
+
+**Nota sobre o Dockerfile:** Por padrão, o container inicializa o backend usando o Gunicorn procurando o arquivo `run.py` e a instância `app`. Se o arquivo principal do seu projeto se chamar `main.py`, lembre-se de alterar a última linha do `Dockerfile` para `["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]`.
