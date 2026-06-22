@@ -1,0 +1,164 @@
+name: CI/CD Pipeline
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    env:
+      TESTING: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-cov fakeredis
+
+      - name: Run tests
+        run: |
+          if [ -d "tests" ]; then
+            python -m pytest tests -q --maxfail=1 --disable-warnings \
+              --cov=app --cov-report=term-missing:skip-covered --cov-report=xml || true
+          fi
+
+      - name: Extract coverage percent
+        id: cov
+        if: always() && hashFiles('coverage.xml') != ''
+        run: |
+          python - << 'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          try:
+              tree = ET.parse('coverage.xml')
+              root = tree.getroot()
+              line_rate = float(root.attrib.get('line-rate', '0'))
+              pct = round(line_rate * 100, 2)
+          except Exception:
+              pct = 0.0
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f"coverage={pct}\n")
+          PY
+
+      - name: Comment PR with test result
+        if: always() && steps.cov.outputs.coverage != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}';
+            const coverage = '${{ steps.cov.outputs.coverage }}';
+            const ok = status === 'success';
+            const title = ok ? 'Testes concluídos' : '❌ Falha nos testes';
+            const body = `### ${title}\n\n- **Status**: ${status}\n- **Cobertura de Código**: ${coverage}%`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      should-deploy: ${{ steps.meta.outputs.should-deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Determine tags
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          REPO="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHOULD_DEPLOY="false"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            TAGS="${REPO}:${TAG},${REPO}:latest"
+            SHOULD_DEPLOY="true"
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            TAG="main-${SHORT_SHA}"
+            TAGS="${REPO}:${TAG},${REPO}:latest"
+            SHOULD_DEPLOY="true"
+          elif [[ "${GITHUB_REF_NAME}" == "dev" ]]; then
+            TAG="dev-${SHORT_SHA}"
+            TAGS="${REPO}:${TAG},${REPO}:dev"
+            SHOULD_DEPLOY="false"
+          else
+            TAG="sha-${SHORT_SHA}"
+            TAGS="${REPO}:${TAG}"
+            SHOULD_DEPLOY="false"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "tags=${TAGS}"
+            echo "should-deploy=${SHOULD_DEPLOY}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ hashFiles('Dockerfile') != '' && 'Dockerfile' || 'docker/Dockerfile' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Trigger Portainer Webhook
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.should-deploy == 'true'
+    steps:
+      - name: Dispatch Portainer Webhook
+        run: |
+          if [ -n "${{ secrets.PORTAINER_WEBHOOK_URL }}" ]; then
+            echo "Disparando atualização..."
+            curl -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}"
+            echo "Webhook enviado com sucesso!"
+          else
+            echo "PORTAINER_WEBHOOK_URL não configurado nas Secrets deste repositório. Pulando deploy."
+          fi

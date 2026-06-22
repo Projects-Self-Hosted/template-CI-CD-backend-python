@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  api-projeto:
+    image: newmatheused/NOME_DESTE_REPOSITORIO:latest
+    container_name: api-projeto-container
+    restart: always
+    networks:
+      - dev-network
+
+networks:
+  dev-network:
+    external: true
